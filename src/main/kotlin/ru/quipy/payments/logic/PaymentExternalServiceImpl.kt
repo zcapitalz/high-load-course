@@ -2,6 +2,10 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -14,6 +18,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 
 // Advice: always treat time as a Duration
@@ -41,15 +46,12 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        limiter.lease()
-        try {
-            performPaymentAsyncNoLimit(paymentId, amount, paymentStartedAt, deadline)
-        } finally {
-            limiter.release()
+        limiter.executeWithDeadlineAsync(Dispatchers.Default, deadline-requestAverageProcessingTime.toMillis()) {
+            performPayment(paymentId, amount, paymentStartedAt)
         }
     }
 
-    private fun performPaymentAsyncNoLimit(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()

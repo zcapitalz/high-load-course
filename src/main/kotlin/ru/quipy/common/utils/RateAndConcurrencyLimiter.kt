@@ -1,7 +1,10 @@
 package ru.quipy.common.utils
 
+import kotlinx.coroutines.*
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.withLock
+import kotlin.coroutines.CoroutineContext
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.min
 
 class RateAndConcurrencyLimiter(
@@ -18,19 +21,23 @@ class RateAndConcurrencyLimiter(
 
     private var blockingLoopDelayMs = min(1, rateLimitWindowMs / concurrencyLimit / 2)
 
-    fun execute(f: () -> Unit) {
-        lease()
-        try {
-            f()
-        } finally {
-            release()
+    fun executeWithDeadlineAsync(coroutineCtx: CoroutineContext, deadline: Long, block: () -> Unit) {
+        CoroutineScope(coroutineCtx).launch {
+            withTimeout(deadline - System.currentTimeMillis()) {
+                lease()
+                try {
+                    block()
+                } finally {
+                    release()
+                }
+            }
         }
     }
 
-    fun lease() {
+    suspend fun lease() {
         while (true) {
             while (!(canAddRate() && canAddConcurrent())) {
-                Thread.sleep(blockingLoopDelayMs)
+                delay(blockingLoopDelayMs)
             }
             if (!addRate()) {
                 continue
