@@ -1,10 +1,13 @@
 package ru.quipy.common.utils
 
 import kotlinx.coroutines.*
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.*
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.withLock
 import kotlin.coroutines.CoroutineContext
-import kotlin.coroutines.cancellation.CancellationException
 import kotlin.math.min
 
 class RateAndConcurrencyLimiter(
@@ -19,18 +22,22 @@ class RateAndConcurrencyLimiter(
     private var concurrencyCount : Long = 0
     private var concurrencyRwLock = ReentrantReadWriteLock()
 
-    private var blockingLoopDelayMs = min(1, rateLimitWindowMs / concurrencyLimit / 2)
+    private var blockingLoopDelayMs = min(10, rateLimitWindowMs / concurrencyLimit / 2)
 
     fun executeWithDeadlineAsync(coroutineCtx: CoroutineContext, deadline: Long, block: () -> Unit) {
         CoroutineScope(coroutineCtx).launch {
             withTimeout(deadline - System.currentTimeMillis()) {
-                lease()
-                try {
-                    block()
-                } finally {
-                    release()
-                }
+                execute(block)
             }
+        }
+    }
+
+    suspend fun execute(block: () -> Unit) {
+        lease()
+        try {
+            block()
+        } finally {
+            release()
         }
     }
 
@@ -58,19 +65,20 @@ class RateAndConcurrencyLimiter(
 
     private fun canAddConcurrent(): Boolean {
         concurrencyRwLock.readLock().withLock {
-            return concurrencyCount < concurrencyLimit
+            var res = concurrencyCount < concurrencyLimit
+            if (!res) {
+//                println("can't add concurrent")
+            }
+            return res
         }
     }
 
     private fun addConcurrent(): Boolean {
         concurrencyRwLock.writeLock().withLock {
             if (concurrencyCount >= concurrencyLimit) {
+//                println("could not add concurrent")
                 return false
             }
-            // Read-write lock is used for concurrencyCount to have a strict guarantee
-            // that concurrencyCount has not changed here since it was read in above comparison.
-            // It may be acceptable to use atomic counter instead in case of big throughput and
-            // if we can allow concurrencyCount to get bigger than concurrencyLimit sometimes.
             concurrencyCount++
             return true
         }
@@ -83,6 +91,7 @@ class RateAndConcurrencyLimiter(
             if (tickTimestamps[head] < windowStart) {
                 return true
             }
+//            logRateLimitHit(now)
             return false
         }
     }
@@ -96,7 +105,28 @@ class RateAndConcurrencyLimiter(
                 head = (head + 1) % rateLimit
                 return true
             }
+//            println("could not add rate")
             return false
         }
+    }
+
+    private fun logRateLimitHit(now: Long) {
+        val formatter = DateTimeFormatter
+            .ofPattern("mm:ss.SSS")
+            .withZone(ZoneId.systemDefault())
+
+        val nowFormatted = formatter.format(Instant.ofEpochMilli(now))
+        println("can't add rate at ${nowFormatted}, window: ${formatTicks(formatter)}")
+    }
+
+    private fun formatTicks(formatter: DateTimeFormatter): String {
+        val result = mutableListOf<String>()
+        var i = head
+        do {
+            result.add(formatter.format(Instant.ofEpochMilli(tickTimestamps[i])))
+            i = (i + 1) % tickTimestamps.size
+        } while (i != head)
+
+        return result.joinToString(prefix = "[", postfix = "]")
     }
 }
