@@ -14,10 +14,10 @@ class Retryer(private val maxRetries: Int) {
         CoroutineScope(coroutineCtx).launch {
             withTimeout(deadline - System.currentTimeMillis()) {
                 for (i in 1..maxRetries) {
+                    delay(1)
                     if (i > 1) {
                         println("$requestId: retrying ${i-1} time")
                     }
-                    delay(1)
                     try {
                         block()
                     } catch (e: RetryableError) {
