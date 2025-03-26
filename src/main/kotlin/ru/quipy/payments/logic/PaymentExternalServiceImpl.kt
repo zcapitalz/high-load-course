@@ -1,11 +1,9 @@
 package ru.quipy.payments.logic
 
+import RequestDurationTracker
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -13,14 +11,14 @@ import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.RateAndConcurrencyLimiter
 import ru.quipy.common.utils.RetryableError
 import ru.quipy.common.utils.Retryer
-import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.lang.Long.max
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.coroutineContext
+import kotlin.math.min
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -41,22 +39,42 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val maxRetries = 10;
+    private val executionTimeoutPercentile = 80.0
+    private val executionTimeoutFactor = 1.3
+    private val minPaymentTimeout = 300L
 
     private val limiter = RateAndConcurrencyLimiter(
         rateLimitPerSec, 1000, parallelRequests.toLong())
     private val retryer = Retryer(maxRetries)
+    private val requestDurationTracker = RequestDurationTracker(10, 100)
 
     private val client = OkHttpClient.Builder().build()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        retryer.executeWithDeadlineAsync(Dispatchers.Default, deadline, paymentId) {
+        val timeoutMs = getPaymentTimeout()
+        println("setting timeout ${timeoutMs}ms")
+        var optimizedDeadline = min(deadline, System.currentTimeMillis() + timeoutMs)
+        retryer.executeWithDeadlineAsync(
+            Dispatchers.Default,
+            optimizedDeadline,
+            paymentId)
+        {
             limiter.execute() {
-                performPayment(paymentId, amount, paymentStartedAt)
+                requestDurationTracker.track() {
+                    performPayment(paymentId, amount, paymentStartedAt, timeoutMs)
+                }
             }
         }
     }
 
-    private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+    private fun getPaymentTimeout(): Long {
+        val timeout = requestDurationTracker.getPercentileOrDefault(
+            executionTimeoutPercentile,
+            requestAverageProcessingTime.toMillis().toDouble())
+        return max((timeout * executionTimeoutFactor).toLong(), minPaymentTimeout)
+    }
+
+    private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, timeoutMs: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
@@ -74,7 +92,8 @@ class PaymentExternalSystemAdapterImpl(
         }.build()
 
         try {
-            client.newCall(request).execute().use { response ->
+            val newClient = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+            newClient.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
