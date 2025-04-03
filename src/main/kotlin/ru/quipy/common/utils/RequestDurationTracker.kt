@@ -37,10 +37,10 @@ class RequestDurationTracker(private val minSize: Int = 10, private val maxSize:
 
         val durations = getDurations()
         durations.sort()
-        println("durations: ${durations.joinToString()}")
+//        println("durations: ${durations.joinToString()}")
         val index = ceil(percentile / 100.0 * durations.size).toInt() - 1
         val res = durations[index]
-        println("percentile $percentile value: $res")
+//        println("percentile $percentile value: $res")
         return res
 //        return percentile.evaluate(n)
     }

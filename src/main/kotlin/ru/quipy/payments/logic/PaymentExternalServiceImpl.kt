@@ -3,20 +3,24 @@ package ru.quipy.payments.logic
 import RequestDurationTracker
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.launch
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.RateAndConcurrencyLimiter
 import ru.quipy.common.utils.RetryableError
 import ru.quipy.common.utils.Retryer
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.File
+import java.io.IOException
 import java.lang.Long.max
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
@@ -25,6 +29,10 @@ class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
 ) : PaymentExternalSystemAdapter {
+
+    init {
+        File("/home/zcapital/repo/itmo/sem-8/ppo/high-load-course/log.txt").writeText("")
+    }
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
@@ -38,24 +46,32 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
-    private val maxRetries = 10;
+    private val maxRetries = 10
     private val executionTimeoutPercentile = 80.0
-    private val executionTimeoutFactor = 1.3
+    private val executionTimeoutFactor = 2
     private val minPaymentTimeout = 300L
 
     private val limiter = RateAndConcurrencyLimiter(
-        rateLimitPerSec, 1000, parallelRequests.toLong())
+        rateLimitPerSec, 1000, parallelRequests.toLong()+10)
     private val retryer = Retryer(maxRetries)
     private val requestDurationTracker = RequestDurationTracker(10, 100)
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = parallelRequests
+            maxRequestsPerHost = parallelRequests
+        })
+        .connectionPool(ConnectionPool(parallelRequests, 5, TimeUnit.MINUTES))
+        .build()
+
+    private val threadPoolSize = parallelRequests+50
+    private val coroutineDispatcher = Executors.newFixedThreadPool(threadPoolSize).asCoroutineDispatcher()
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         val timeoutMs = getPaymentTimeout()
-        println("setting timeout ${timeoutMs}ms")
         var optimizedDeadline = min(deadline, System.currentTimeMillis() + timeoutMs)
         retryer.executeWithDeadlineAsync(
-            Dispatchers.Default,
+            coroutineDispatcher,
             optimizedDeadline,
             paymentId)
         {
@@ -70,13 +86,12 @@ class PaymentExternalSystemAdapterImpl(
     private fun getPaymentTimeout(): Long {
         val timeout = requestDurationTracker.getPercentileOrDefault(
             executionTimeoutPercentile,
-            requestAverageProcessingTime.toMillis().toDouble())
+//            requestAverageProcessingTime.toMillis().toDouble())
+            20000.0)
         return max((timeout * executionTimeoutFactor).toLong(), minPaymentTimeout)
     }
 
     private fun performPayment(paymentId: UUID, amount: Int, paymentStartedAt: Long, timeoutMs: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
         val transactionId = UUID.randomUUID()
 //        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
@@ -91,8 +106,9 @@ class PaymentExternalSystemAdapterImpl(
             post(emptyBody)
         }.build()
 
+        val newClient = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
+//        val newClient = client
         try {
-            val newClient = client.newBuilder().callTimeout(timeoutMs, TimeUnit.MILLISECONDS).build()
             newClient.newCall(request).execute().use { response ->
                 val body = try {
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -113,7 +129,7 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if (!body.result && !(response.code >= 400 && response.code <= 499)) {
-                    println("throwing retryable error")
+//                    println("throwing retryable error")
                     throw RetryableError("can be retried")
                 }
             }
